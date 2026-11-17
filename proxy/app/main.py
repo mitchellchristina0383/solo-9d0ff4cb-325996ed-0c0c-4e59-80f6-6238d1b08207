@@ -8,6 +8,13 @@
   3. 切流前先探测目标节点 /healthz，探测失败则保留旧路由并返回 409。
   4. 读超时（写入大概率已在后端落库，只是回执没回来）标记为 TIMEOUT_UNCERTAIN，
      返回 504 并在页面提示"结果不确定"，代理不做任何自动补投/重试。
+
+变更记录（值班续看）语义：
+  * 成功切流、写入受理、写入结论改变时，各自的状态变更与该条事件在同一 SQLite
+    事务中提交（见 db.commit_switch / insert_write / transition_write）。
+  * events.id 是持久化游标；GET /api/changes?after=<id> 按提交顺序升序翻页。
+    events 表与 route/writes 在同一个 SQLite 卷里，代理重启后游标仍有效。
+  * 被拦截的切流、故障注入、启动等只记普通日志（change=0），不算变更事件。
 """
 from __future__ import annotations
 
@@ -109,10 +116,11 @@ async def switch(request: Request) -> JSONResponse:
 
     healthy, detail = await probe_node(nodes[target])
     if not healthy:
-        # 探测失败：保持旧路由，不动 route 表。
+        # 探测失败：保持旧路由，不动 route 表。这只是日志，不是变更。
         await db.add_event(
             "SWITCH_BLOCKED",
             f"{active} -> {target} blocked, target unhealthy: {detail}",
+            node=target,
         )
         return JSONResponse(
             status_code=409,
@@ -121,16 +129,26 @@ async def switch(request: Request) -> JSONResponse:
                      "message": "kept old route"},
         )
 
+    # 在提交点快照在途数，并让"改 route + 写 SWITCH_OK"在同一个事务里完成。
+    # commit_switch 会重新读取现役节点做比较交换：并发切到同一目标时只有一个
+    # 请求生效并留下事件，另一个按 noop 返回，不会重复记录。
     async with _inflight_lock:
         inflight_snapshot = {k: len(v) for k, v in _inflight.items()}
-        await db.set_active(target)
-    await db.add_event(
-        "SWITCH_OK",
-        f"{active} -> {target} ok; inflight at cutover={inflight_snapshot}; "
-        "new requests now route to target, in-flight requests stay on old node",
+    changed, previous = await db.commit_switch(
+        target,
+        lambda prev: (
+            f"{prev} -> {target} ok; inflight at cutover={inflight_snapshot}; "
+            "new requests now route to target, in-flight requests stay on old node"
+        ),
     )
+    if not changed:
+        # 探测期间另一个并发切流已经把 target 变成了现役；没有生效变化就不写事件。
+        return JSONResponse(content={
+            "ok": True, "noop": True, "active": target,
+            "message": "target became active concurrently; no change recorded",
+        })
     return JSONResponse(content={
-        "ok": True, "active": target, "previous": active,
+        "ok": True, "active": target, "previous": previous,
         "inflight_at_cutover": inflight_snapshot,
         "message": "switch done; in-flight writes continue against their original node",
     })
@@ -146,6 +164,29 @@ async def _track(node: str, write_id: str) -> None:
 async def _untrack(node: str, write_id: str) -> None:
     async with _inflight_lock:
         _inflight.setdefault(node, set()).discard(write_id)
+
+
+async def _conclusion_conflict(
+    write_id: str, node: str, intended: str, default_code: int
+) -> JSONResponse:
+    """结论变更没有生效时（并发核实已先定下终态），据实返回当前落库结论。
+
+    典型交错：慢回执超时前，用户点"向原节点查询"已确认 ACKED；随后迟到的
+    超时处理不得把结论回退为 TIMEOUT_UNCERTAIN，响应也不能谎称"不确定"。
+    """
+    row = await db.get_write(write_id)
+    actual = row["status"] if row else intended
+    return JSONResponse(
+        status_code=200 if actual == db.ACKED else default_code,
+        content={
+            "id": write_id,
+            "node": node,
+            "status": actual,
+            "detail": row["status_detail"] if row else "",
+            "uncertain": actual == db.TIMEOUT_UNCERTAIN,
+            "concurrent_resolution": actual != intended,
+        },
+    )
 
 
 @app.post("/api/writes")
@@ -166,7 +207,15 @@ async def proxy_write(request: Request) -> JSONResponse:
     body["id"] = write_id
     payload = str(body.get("payload", ""))
 
-    await db.insert_write(write_id, active, payload, delay)
+    # 受理即落库：writes 行（PENDING）与 WRITE_ACCEPTED 变更事件在同一事务提交。
+    try:
+        await db.insert_write(write_id, active, payload, delay)
+    except db.DuplicateWrite:
+        # 客户端复用了已有 ID：不重投，也不伪造第二条"受理"事件。
+        return JSONResponse(
+            status_code=409,
+            content={"id": write_id, "error": "write id already exists; not re-delivered"},
+        )
     await _track(active, write_id)
     client: httpx.AsyncClient = app.state.http
     try:
@@ -177,8 +226,13 @@ async def proxy_write(request: Request) -> JSONResponse:
             httpx.WriteTimeout) as exc:
         # 连接层面失败：请求没有被后端受理，标记 FAILED，不向任何节点补投。
         detail = f"connect to {active} failed: {type(exc).__name__}: {exc}"
-        await db.update_write_status(write_id, db.FAILED, detail)
-        await db.add_event("WRITE_FAILED", f"{write_id} -> {active}: {detail}")
+        changed = await db.transition_write(
+            write_id, db.FAILED, detail,
+            event_kind="WRITE_FAILED",
+            event_message=f"{write_id} -> {active}: {detail}",
+        )
+        if not changed:
+            return await _conclusion_conflict(write_id, active, db.FAILED, 502)
         return JSONResponse(status_code=502,
                             content={"id": write_id, "node": active,
                                      "status": db.FAILED, "detail": detail})
@@ -187,16 +241,29 @@ async def proxy_write(request: Request) -> JSONResponse:
         detail = (f"read timeout after {READ_TIMEOUT}s waiting ack from {active}; "
                   "write may already be persisted there, result UNCERTAIN; "
                   "no automatic re-delivery to another node")
-        await db.update_write_status(write_id, db.TIMEOUT_UNCERTAIN, detail)
-        await db.add_event("WRITE_TIMEOUT_UNCERTAIN",
-                           f"{write_id} -> {active}: {detail}")
+        changed = await db.transition_write(
+            write_id, db.TIMEOUT_UNCERTAIN, detail,
+            event_kind="WRITE_TIMEOUT_UNCERTAIN",
+            event_message=f"{write_id} -> {active}: {detail}",
+        )
+        if not changed:
+            # 例如核实已在超时返回前确认 ACKED：保持 ACKED，不写不确定事件。
+            return await _conclusion_conflict(
+                write_id, active, db.TIMEOUT_UNCERTAIN, 504
+            )
         return JSONResponse(status_code=504,
                             content={"id": write_id, "node": active,
                                      "status": db.TIMEOUT_UNCERTAIN,
                                      "uncertain": True, "detail": detail})
     except httpx.HTTPError as exc:
         detail = f"unexpected transport error against {active}: {exc}"
-        await db.update_write_status(write_id, db.FAILED, detail)
+        changed = await db.transition_write(
+            write_id, db.FAILED, detail,
+            event_kind="WRITE_FAILED",
+            event_message=f"{write_id} -> {active}: {detail}",
+        )
+        if not changed:
+            return await _conclusion_conflict(write_id, active, db.FAILED, 502)
         return JSONResponse(status_code=502,
                             content={"id": write_id, "node": active,
                                      "status": db.FAILED, "detail": detail})
@@ -208,20 +275,30 @@ async def proxy_write(request: Request) -> JSONResponse:
             ack = resp.json()
         except Exception:
             ack = {}
-        await db.update_write_status(
-            write_id, db.ACKED,
-            f"acked by {active} (backend status={ack.get('status', 'acked')})",
+        detail = f"acked by {active} (backend status={ack.get('status', 'acked')})"
+        changed = await db.transition_write(
+            write_id, db.ACKED, detail,
+            event_kind="WRITE_ACKED",
+            event_message=f"{write_id} acked by {active}",
             acked=True,
         )
-        await db.add_event("WRITE_ACKED", f"{write_id} acked by {active}")
+        if not changed:
+            # 只有"核实先到、迟到回执后到"的交错才会走到这里：结论已是 ACKED，
+            # 只把说明更新为后到的回执信息，不重复记变更。
+            await db.update_write_detail(write_id, detail)
         return JSONResponse(status_code=201,
                             content={"id": write_id, "node": active,
                                      "status": db.ACKED, "backend": ack})
 
     # 后端明确拒绝（如故障态 500）：未受理，FAILED；同样不补投。
     detail = f"{active} rejected with HTTP {resp.status_code}: {resp.text[:300]}"
-    await db.update_write_status(write_id, db.FAILED, detail)
-    await db.add_event("WRITE_FAILED", f"{write_id} -> {active}: {detail}")
+    changed = await db.transition_write(
+        write_id, db.FAILED, detail,
+        event_kind="WRITE_FAILED",
+        event_message=f"{write_id} -> {active}: {detail}",
+    )
+    if not changed:
+        return await _conclusion_conflict(write_id, active, db.FAILED, 502)
     return JSONResponse(
         status_code=502,
         content={"id": write_id, "node": active, "status": db.FAILED, "detail": detail},
@@ -246,8 +323,10 @@ async def refresh_write(write_id: str) -> JSONResponse:
         )
     except httpx.RequestError as exc:
         detail = f"refresh query to original node {node} failed: {type(exc).__name__}"
-        await db.update_write_status(write_id, row["status"],
-                                     f"{row['status_detail']} | {detail}")
+        # 核实失败只是说明文字变化，结论未改变：不生成变更事件。
+        await db.update_write_detail(
+            write_id, f"{row['status_detail']} | {detail}"
+        )
         refreshed = await db.get_write(write_id)
         return JSONResponse(status_code=200,
                             content={"refreshed": False, "write": refreshed,
@@ -259,19 +338,48 @@ async def refresh_write(write_id: str) -> JSONResponse:
         return JSONResponse(content={"refreshed": False, "write": row, "note": note})
 
     data = resp.json()
-    if data.get("status") == "acked" and row["status"] != db.ACKED:
-        await db.update_write_status(
+    if data.get("status") == "acked":
+        # transition_write 只在结论真的从非 ACKED 变为 ACKED 时写事件；
+        # 反复核实同一结论不会重复记录。
+        await db.transition_write(
             write_id, db.ACKED,
-            f"acked confirmed later by original node {node}", acked=True
+            f"acked confirmed later by original node {node}",
+            event_kind="WRITE_RESOLVED",
+            event_message=f"{write_id} confirmed acked by original node {node}",
+            acked=True,
         )
-        await db.add_event("WRITE_RESOLVED",
-                           f"{write_id} confirmed acked by original node {node}")
     refreshed = await db.get_write(write_id)
     return JSONResponse(content={"refreshed": True, "write": refreshed,
                                  "backend_view": data})
 
 
 # ---------------------------------------------------------------- 状态/排空
+
+@app.get("/api/changes")
+async def changes(after: int = 0, limit: int = 100) -> JSONResponse:
+    """按持久游标续看变更记录：返回 id > after 的变更事件，按提交顺序升序。
+
+    - 事件 id 在 SQLite 中单调递增，且与对应的路由/写入状态同事务提交；
+    - 代理重启后同一 after 仍可继续翻页（events 表在持久卷里）；
+    - has_more=true 时客户端可把 next_after 作为下一次的 after 继续；
+    - latest 是当前最大变更 id，便于页面判断"已追平"。
+    """
+    if after < 0 or limit < 1 or limit > 500:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "after must be >= 0 and 1 <= limit <= 500"},
+        )
+    rows, has_more, latest = await db.list_changes(after=after, limit=limit)
+    return JSONResponse(content={
+        "after": after,
+        "limit": limit,
+        "latest": latest,
+        "has_more": has_more,
+        "next_after": rows[-1]["id"] if rows else after,
+        "count": len(rows),
+        "events": rows,
+    })
+
 
 @app.get("/api/status")
 async def status() -> JSONResponse:
@@ -310,6 +418,7 @@ async def status() -> JSONResponse:
         "drainage": per_node,
         "writes": writes,
         "events": await db.list_events(),
+        "changes_latest": await db.latest_change_id(),
         "timeouts": {"connect": CONNECT_TIMEOUT, "read": READ_TIMEOUT,
                      "probe": PROBE_TIMEOUT},
     })
@@ -347,7 +456,8 @@ async def node_fault(name: str, request: Request) -> JSONResponse:
         return JSONResponse(status_code=502,
                             content={"error": f"node {name} unreachable: {exc}"})
     await db.add_event("FAULT_INJECTION",
-                       f"node {name} fault on={bool(body.get('on', True))}")
+                       f"node {name} fault on={bool(body.get('on', True))}",
+                       node=name)
     return JSONResponse(content=resp.json())
 
 

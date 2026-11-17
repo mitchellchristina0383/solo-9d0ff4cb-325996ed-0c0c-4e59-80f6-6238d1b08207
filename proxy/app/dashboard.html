@@ -50,6 +50,12 @@
   .kv b { color:var(--mut); font-weight:600; }
   .uncertain-note { border-left:3px solid var(--warn); padding:8px 12px; background:rgba(241,185,68,.08);
                     border-radius:0 8px 8px 0; font-size:12.5px; }
+  .cursor-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .cursor-row input[type=number] { width:140px; }
+  .ev-id { color:var(--mut); font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .ev-wid { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; word-break:break-all; }
+  #changes tbody tr.new-row { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { background:rgba(74,163,255,.18); } to { background:transparent; } }
 </style>
 </head>
 <body>
@@ -57,6 +63,7 @@
   <h1>写入切流控制台</h1>
   <span>现役节点：<span id="active" class="badge b-info">-</span></span>
   <span class="muted" id="clock"></span>
+  <span class="muted">变更已追平到 <code id="changes-cursor-badge">-</code></span>
   <span style="flex:1"></span>
   <label class="muted"><input type="checkbox" id="autopoll" checked> 每 2 秒自动刷新</label>
 </header>
@@ -100,7 +107,27 @@
   </section>
 
   <section class="card">
-    <h2>事件日志（切流 / 探测拦截 / 回执 / 超时）</h2>
+    <h2>变更记录（按持久游标续看：成功切流 / 写入受理 / 写入结论改变）</h2>
+    <div class="cursor-row">
+      <label class="muted">上次游标 after <input type="number" id="cursor" min="0" step="1" value="0"></label>
+      <button id="changes-load">从游标续看</button>
+      <button id="changes-follow">追平最新</button>
+      <button id="changes-reset">从头看（游标 0）</button>
+      <label class="muted"><input type="checkbox" id="changes-live"> 每 3 秒自动续看</label>
+    </div>
+    <p class="muted" style="margin:0 0 10px">
+      游标 AFTER 保存的是上一条已看变更的 ID；浏览器断线或代理重启后，把它填回来即可继续。
+      下方“已追平到”显示已加载的最大变更 ID。
+    </p>
+    <div style="overflow:auto"><table id="changes">
+      <thead><tr><th>游标 ID</th><th>时间</th><th>变更类型</th><th>节点</th><th>写入 ID</th><th>新状态</th><th>说明</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p class="muted" id="changes-meta" style="margin:10px 0 0">尚未加载。</p>
+  </section>
+
+  <section class="card">
+    <h2>事件日志（最近 30 条原始事件，含启动/拦截/故障注入等非变更日志）</h2>
     <table><thead><tr><th>时间</th><th>类型</th><th>内容</th></tr></thead>
     <tbody id="events"></tbody></table>
   </section>
@@ -134,7 +161,7 @@ async function switchTo(target){
   try{
     const r = await api('/api/switch', {method:'POST', body:JSON.stringify({target})});
     toast(r.noop ? `目标 ${target} 已是现役节点` : `切流成功：${r.previous} → ${r.active}`);
-    await refresh();
+    await refresh(); await followChanges();
   }catch(e){ toast('切流被拦截，保持旧路由：'+e.message, false); await refresh(); }
 }
 async function setFault(name, on){
@@ -150,7 +177,7 @@ async function loadRecords(name){
 async function refreshOne(id){
   try{ const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh`);
     toast(r.note ? r.note : `已向原节点 ${r.write.target_node} 查询：${r.write.status}`);
-    await refresh();
+    await refresh(); await followChanges();
   }catch(e){ toast('查询失败：'+e.message, false); }
 }
 
@@ -167,7 +194,7 @@ $('#send').onclick = async () => {
     const d = e.data || {};
     if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
     else toast('写入失败：'+e.message, false);
-  }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
+  }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); await followChanges(); }
 };
 
 async function refresh(){
@@ -213,6 +240,128 @@ async function refresh(){
     <td class="muted">${fmt(ev.ts)}</td><td><span class="badge b-mut">${esc(ev.kind)}</span></td>
     <td style="max-width:680px">${esc(ev.message)}</td></tr>`).join('');
 }
+
+// ---------------------------------------------------------------- 变更记录（游标续看）
+const CURSOR_KEY = 'cutover-changes-after';
+let loadedCursor = 0;          // 已加载到的最大变更事件 ID
+let loadingChanges = false;
+const loadedIds = new Set();
+
+function setCursorUI(v){
+  loadedCursor = v;
+  $('#cursor').value = v;
+  $('#changes-cursor-badge').textContent = v;
+  try { localStorage.setItem(CURSOR_KEY, String(v)); } catch(e) {}
+}
+function clearChanges(){
+  loadedIds.clear();
+  $('#changes tbody').innerHTML = '';
+}
+function appendChanges(events){
+  const tbody = $('#changes tbody');
+  let added = 0;
+  for (const ev of events){
+    if (loadedIds.has(ev.id)) continue;   // 防御性去重：同一游标重复拉取不重复显示
+    loadedIds.add(ev.id); added++;
+    const tr = document.createElement('tr');
+    tr.className = 'new-row';
+    tr.innerHTML = `<td class="ev-id">${ev.id}</td>
+      <td class="muted">${fmt(ev.ts)}</td>
+      <td><span class="badge b-mut">${esc(ev.kind)}</span></td>
+      <td>${ev.node ? `<span class="badge b-info">${esc(ev.node)}</span>` : '<span class="muted">-</span>'}</td>
+      <td class="ev-wid">${ev.write_id ? esc(ev.write_id) : '<span class="muted">-</span>'}</td>
+      <td>${ev.state ? statusBadge(ev.state) : '<span class="muted">-</span>'}</td>
+      <td class="muted" style="max-width:420px">${esc(ev.message)}</td>`;
+    tbody.appendChild(tr);
+  }
+  return added;
+}
+async function fetchChanges(after, limit=100){
+  return api(`/api/changes?after=${encodeURIComponent(after)}&limit=${limit}`);
+}
+async function loadFromCursor(start, {append=false, maxPages=20} = {}){
+  if (loadingChanges) return;
+  loadingChanges = true;
+  const btn = $('#changes-load');
+  const prev = btn.textContent; btn.disabled = true; btn.textContent = '加载中…';
+  try{
+    if (!append) clearChanges();
+    let cursor = start, pages = 0, added = 0, latest = cursor;
+    while (pages < maxPages){
+      const r = await fetchChanges(cursor, 100);
+      pages++;
+      latest = r.latest;
+      if (latest < cursor){
+        // 服务端游标比请求的 after 小：events 卷被重建。清空后从头开始，
+        // 不能继续用一个服务端不存在的游标翻页。
+        clearChanges(); cursor = 0; setCursorUI(0);
+        if (start === 0) break;
+        start = 0;
+        continue;
+      }
+      added += appendChanges(r.events);
+      if (r.events.length) cursor = r.next_after;
+      if (!r.has_more) break;
+    }
+    setCursorUI(cursor);
+    const more = pages >= maxPages ? '（本次达到翻页上限，可再点一次继续）' : '';
+    $('#changes-meta').textContent =
+      `从游标 ${start} 起加载 ${pages} 页、新增 ${added} 条；已追平到 ${cursor}，服务端最新变更 ${latest}。${more}`;
+  }catch(e){
+    $('#changes-meta').textContent = '加载变更失败：' + e.message +
+      `（本地游标仍为 ${loadedCursor}，可下次重试）`;
+  }finally{
+    loadingChanges = false; btn.disabled = false; btn.textContent = prev;
+  }
+}
+// 自动续看：只拉"已加载游标之后"的新事件，追加在表格尾部。
+async function followChanges(){
+  if (loadingChanges) return;
+  loadingChanges = true;
+  try{
+    let cursor = loadedCursor, pages = 0, latest = cursor;
+    while (pages < 5){
+      const r = await fetchChanges(cursor, 200);
+      pages++;
+      latest = r.latest;
+      if (latest < cursor){
+        // 服务端游标比本地小：events 卷被重建/换库了。清空后从头追看，
+        // 否则会永远停在一个不存在的游标上。
+        clearChanges(); cursor = 0; setCursorUI(0); continue;
+      }
+      appendChanges(r.events);
+      if (r.events.length) cursor = r.next_after;
+      if (!r.has_more) break;
+    }
+    if (cursor !== loadedCursor) setCursorUI(cursor);
+    $('#changes-meta').textContent = `已追平到 ${cursor}，服务端最新变更 ${latest}。`;
+  }catch(e){
+    $('#changes-meta').textContent = '自动续看失败（将重试）：' + e.message;
+  }finally{ loadingChanges = false; }
+}
+
+$('#changes-load').onclick = () => {
+  const v = Math.max(0, parseInt($('#cursor').value, 10) || 0);
+  loadFromCursor(v);
+};
+$('#changes-follow').onclick = () => loadFromCursor(loadedCursor, {append: true});
+$('#changes-reset').onclick = () => { setCursorUI(0); loadFromCursor(0); };
+$('#changes-live').onchange = () => armChanges();
+
+let changesTimer;
+function armChanges(){
+  clearInterval(changesTimer);
+  if ($('#changes-live').checked) changesTimer = setInterval(followChanges, 3000);
+}
+
+// 页面刷新/断线重连后，用浏览器保存的上次游标继续追看；也可手动改游标。
+(function initChanges(){
+  let saved = 0;
+  try { saved = parseInt(localStorage.getItem(CURSOR_KEY) || '0', 10) || 0; } catch(e) {}
+  setCursorUI(saved);
+  loadFromCursor(saved);
+})();
+armChanges();
 let timer;
 function arm(){ clearInterval(timer); if($('#autopoll').checked) timer = setInterval(refresh, 2000); }
 $('#autopoll').onchange = arm;
